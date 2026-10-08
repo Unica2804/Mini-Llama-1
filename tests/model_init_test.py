@@ -18,6 +18,7 @@ def tiny_config():
 		d_model=32,
 		n_layers=2,
 		n_heads=4,
+		num_kv_groups=2,
 		vocab_size=64,
 		max_seq_len=16,
 		seq_len=16,

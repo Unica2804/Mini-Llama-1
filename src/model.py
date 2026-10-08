@@ -18,6 +18,7 @@ class LLamaConfig:
     d_model: int = default_config["d_model"]
     n_layers: int = default_config["n_layers"]
     n_heads: int = default_config["n_heads"]
+    num_kv_groups: int = default_config["num_kv_groups"]
     vocab_size: int = default_config["vocab_size"]
     multiple_of: int = 256
     norm_eps: float = 1e-6
@@ -95,14 +96,27 @@ def apply_rotary_pos_emb(q, k, cos, sin, pos_ids):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-class LlamaMultiHeadAttention(nn.Module):
+def repeat_kv(x:torch.Tensor, num_rep:int)->torch.Tensor:
+    if num_rep == 1:
+        return x
+    B, S, n_kv_heads, D = x.shape
+    return (
+        x[:, :, :, None, :]
+        .expand(B, S, n_kv_heads, num_rep, D)
+        .reshape(B, S, n_kv_heads * num_rep, D)
+    )
+
+class LlamaGroupedQueryAttention(nn.Module):
     def __init__(self,config: LLamaConfig):
         super().__init__()
         self.d_model = config.d_model
         self.num_heads = config.n_heads
         self.head_dim = config.head_dim
+        self.num_kv_groups = config.num_kv_groups
+        self.num_rep = self.num_heads // self.num_kv_groups
 
-        self.wqkv = nn.Linear(self.d_model, 3 * self.d_model, bias=False)
+        qkv_out_dim = (self.num_heads + 2 * self.num_kv_groups) * self.head_dim
+        self.wqkv = nn.Linear(self.d_model, qkv_out_dim, bias=False)
         self.wo = nn.Linear(self.d_model, self.d_model, bias=False)
         self.rotary_pos_emb = RotaryPositionalEncoding(config)
 
@@ -113,10 +127,21 @@ class LlamaMultiHeadAttention(nn.Module):
             pos_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, S)
         
         qkv = self.wqkv(x)
-        qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2) #each is B,S,H,D contigious view
+        q_dim = self.num_heads * self.head_dim
+        kv_dim = self.num_kv_groups * self.head_dim
+        q = qkv[..., :q_dim]
+        k = qkv[..., q_dim:q_dim + kv_dim]
+        v = qkv[..., q_dim + kv_dim:]
+
+        q=q.view(B,S,self.num_heads,self.head_dim)
+        k=k.view(B,S,self.num_kv_groups,self.head_dim)
+        v=v.view(B,S,self.num_kv_groups,self.head_dim)
+        
         cos, sin = self.rotary_pos_emb(v, S)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, pos_ids)
+
+        k = repeat_kv(k, self.num_rep)
+        v = repeat_kv(v, self.num_rep)
 
         out = xops.memory_efficient_attention(
             q,k,v,
@@ -138,7 +163,7 @@ class LlamaFeedForward(nn.Module):
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LLamaConfig):
         super().__init__()
-        self.self_attn = LlamaMultiHeadAttention(config)
+        self.self_attn = LlamaGroupedQueryAttention(config)
         self.norm1 = RMSNorm(config)
         self.ffn = LlamaFeedForward(config)
         self.norm2 = RMSNorm(config)
